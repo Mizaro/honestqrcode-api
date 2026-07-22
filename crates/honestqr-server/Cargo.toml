@@ -1,0 +1,18 @@
+[package]
+name = "honestqr-server"
+description = "Portable Honest QR Code HTTP server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+honestqr-http = { path = "../honestqr-http" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

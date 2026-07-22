@@ -1,0 +1,12 @@
+{
+  "data": {
+    "kind": "url",
+    "url": "https://honestqrcode.com/"
+  },
+  "render": {
+    "format": "png",
+    "width": 256,
+    "margin": 4,
+    "error_correction": "high"
+  }
+}

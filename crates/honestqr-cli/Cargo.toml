@@ -1,0 +1,16 @@
+[package]
+name = "honestqr"
+description = "Command-line QR generator powered by Honest QR Code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true
+honestqr-core = { path = "../honestqr-core" }
+serde_json.workspace = true
+

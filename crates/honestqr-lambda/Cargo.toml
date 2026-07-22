@@ -1,0 +1,20 @@
+[package]
+name = "honestqr-lambda"
+description = "AWS Lambda adapter for Honest QR Code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+axum.workspace = true
+honestqr-http = { path = "../honestqr-http" }
+http-body-util.workspace = true
+lambda_http.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing-subscriber.workspace = true
+

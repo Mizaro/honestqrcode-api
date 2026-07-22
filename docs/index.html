@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Honest QR Code API</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #07111f; color: #e5eef7; }
+    body { max-width: 920px; margin: 0 auto; padding: 3rem 1.25rem 5rem; line-height: 1.6; }
+    h1, h2 { line-height: 1.15; } h1 { font-size: clamp(2.2rem, 6vw, 4.2rem); margin-bottom: .5rem; }
+    a { color: #5eead4; } .lede { color: #a8bacd; font-size: 1.2rem; max-width: 720px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    pre { overflow: auto; padding: 1rem; border: 1px solid #274057; border-radius: .8rem; background: #0c1a2a; }
+    .pill { display: inline-block; padding: .25rem .65rem; margin-right: .4rem; border: 1px solid #2dd4bf; border-radius: 999px; color: #99f6e4; }
+    section { margin-top: 3rem; }
+  </style>
+</head>
+<body>
+  <p><span class="pill">Apache-2.0</span><span class="pill">Zero storage</span><span class="pill">Rust</span></p>
+  <h1>Honest QR Code API</h1>
+  <p class="lede">A deterministic, privacy-safe QR renderer you can run as a binary, container, Lambda function, or library. The application does not log request bodies or QR payloads.</p>
+  <p><a href="/openapi.json">OpenAPI 3.1 specification</a> · <a href="https://github.com/Mizaro/honestqrcode-api">Source code</a> · <a href="https://honestqrcode.com/">Free browser generator</a></p>
+
+  <section>
+    <h2>Private POST request</h2>
+    <pre><code>curl -X POST http://localhost:8080/v1/qr \
+  -H "content-type: application/json" \
+  --output wifi.svg \
+  -d '{
+    "data": {
+      "kind": "wifi",
+      "ssid": "My Network",
+      "password": "secret",
+      "security": "wpa"
+    },
+    "render": {
+      "format": "svg",
+      "width": 512,
+      "error_correction": "medium"
+    }
+  }'</code></pre>
+  </section>
+
+  <section>
+    <h2>Simple image URL</h2>
+    <pre><code>&lt;img src="https://api.example.com/v1/qr?data=https%3A%2F%2Fexample.com&amp;format=svg" alt="QR code"&gt;</code></pre>
+    <p>Query strings can appear in proxy and access logs. Use POST for WiFi passwords, contact cards, private links, or any sensitive value.</p>
+  </section>
+
+  <section>
+    <h2>Operational endpoints</h2>
+    <ul>
+      <li><code>/healthz</code> — process liveness</li>
+      <li><code>/readyz</code> — real renderer readiness check</li>
+      <li><code>/metrics</code> — OpenMetrics counters and render latency</li>
+      <li><code>/v1/batch</code> — deterministic ZIP archive with a JSON manifest</li>
+    </ul>
+  </section>
+</body>
+</html>
+

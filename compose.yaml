@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    image: honestqrcode-api:local
+    init: true
+    read_only: true
+    ports:
+      - "8080:8080"
+    environment:
+      HONESTQR_JSON_LOGS: "true"
+      RUST_LOG: "honestqr=info,tower_http=info"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+

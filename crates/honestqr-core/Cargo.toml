@@ -22,7 +22,7 @@ url.workspace = true
 utoipa.workspace = true
 
 [dev-dependencies]
-criterion = "0.7.0"
+criterion = "0.8.2"
 rqrr = "0.10.1"
 
 [[bench]]

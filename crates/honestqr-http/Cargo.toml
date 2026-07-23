@@ -12,7 +12,7 @@ authors.workspace = true
 [dependencies]
 axum.workspace = true
 base64.workspace = true
-honestqr-core = { path = "../honestqr-core" }
+honestqr-core = { version = "0.1.0", path = "../honestqr-core" }
 http.workspace = true
 prometheus-client.workspace = true
 serde.workspace = true

@@ -11,6 +11,5 @@ authors.workspace = true
 
 [dependencies]
 clap.workspace = true
-honestqr-core = { path = "../honestqr-core" }
+honestqr-core = { version = "0.1.0", path = "../honestqr-core" }
 serde_json.workspace = true
-

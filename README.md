@@ -2,7 +2,7 @@
 
 **A fast, deterministic QR rendering API that is genuinely easy to self-host.**
 
-[![CI](https://github.com/Mizaro/honestqrcode-api/actions/workflows/ci.yml/badge.svg)](https://github.com/Mizaro/honestqrcode-api/actions/workflows/ci.yml)
+[![CI](https://github.com/honestqrcode/honestqrcode-api/actions/workflows/ci.yml/badge.svg)](https://github.com/honestqrcode/honestqrcode-api/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](rust-toolchain.toml)
 
@@ -24,7 +24,7 @@ The browser-only generator at [honestqrcode.com](https://honestqrcode.com/) rema
 ### Container
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/mizaro/honestqrcode-api:latest
+docker run --rm -p 8080:8080 ghcr.io/honestqrcode/honestqrcode-api:latest
 curl "http://localhost:8080/v1/qr?data=Hello%20world" --output hello.png
 ```
 

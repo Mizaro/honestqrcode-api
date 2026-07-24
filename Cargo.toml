@@ -13,7 +13,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/Mizaro/honestqrcode-api"
+repository = "https://github.com/honestqrcode/honestqrcode-api"
 homepage = "https://honestqrcode.com/"
 authors = ["Mizaro"]
 

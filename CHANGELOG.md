@@ -14,6 +14,6 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Standalone server, CLI, AWS Lambda adapter, scratch container, Compose, Kubernetes, SAM, and systemd deployment assets.
 - Bounded inputs, stable JSON errors, security headers, private POST cache policy, and payload-free logs.
 
-[Unreleased]: https://github.com/Mizaro/honestqrcode-api/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Mizaro/honestqrcode-api/releases/tag/v0.1.0
+[Unreleased]: https://github.com/honestqrcode/honestqrcode-api/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/honestqrcode/honestqrcode-api/releases/tag/v0.1.0
 

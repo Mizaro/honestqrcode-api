@@ -20,7 +20,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          image: ghcr.io/mizaro/honestqrcode-api:latest
+          image: ghcr.io/honestqrcode/honestqrcode-api:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

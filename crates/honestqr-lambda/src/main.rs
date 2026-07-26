@@ -29,3 +29,21 @@ async fn handle(app: axum::Router, request: Request) -> Result<Response<Body>, E
     let bytes = body.collect().await?.to_bytes();
     Ok(Response::from_parts(parts, Body::Binary(bytes.to_vec())))
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn platform_timeout_exceeds_the_router_deadline() {
+        let template = include_str!("../../../deploy/aws-lambda/template.yaml");
+        let platform_timeout = template
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Timeout: "))
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("SAM template has a numeric function timeout");
+
+        assert!(
+            platform_timeout > honestqr_http::DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            "Lambda must leave headroom above the router timeout"
+        );
+    }
+}

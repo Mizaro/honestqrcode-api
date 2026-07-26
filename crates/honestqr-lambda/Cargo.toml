@@ -11,7 +11,7 @@ authors.workspace = true
 
 [dependencies]
 axum.workspace = true
-honestqr-http = { version = "0.1.0", path = "../honestqr-http" }
+honestqr-http = { version = "0.1.1", path = "../honestqr-http" }
 http-body-util.workspace = true
 lambda_http.workspace = true
 tokio.workspace = true

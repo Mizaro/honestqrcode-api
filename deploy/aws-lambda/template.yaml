@@ -13,7 +13,9 @@ Resources:
       Runtime: provided.al2023
       Architectures: [arm64]
       MemorySize: 256
-      Timeout: 10
+      # Keep the platform deadline above the router's request timeout so the
+      # API can return its stable JSON timeout response instead of being killed.
+      Timeout: 30
       Environment:
         Variables:
           RUST_LOG: honestqr=info
@@ -32,4 +34,3 @@ Resources:
 Outputs:
   ApiUrl:
     Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/"
-

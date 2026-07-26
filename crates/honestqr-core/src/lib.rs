@@ -386,7 +386,8 @@ fn payload_bytes(data: &QrData) -> Result<Vec<u8>, QrError> {
             .into_bytes()
         }
         QrData::Email { to, subject, body } => {
-            validate_email(to)?;
+            let to = validate_mailbox(to)?;
+            let to = percent_encode_mailbox(to);
             let mut serializer = form_urlencoded::Serializer::new(String::new());
             if let Some(subject) = nonempty(subject.as_deref()) {
                 serializer.append_pair("subject", subject);
@@ -509,32 +510,48 @@ fn payload_bytes(data: &QrData) -> Result<Vec<u8>, QrError> {
             description,
         } => {
             require_nonempty("title", title)?;
-            validate_calendar_time("start", start)?;
-            if let Some(end) = nonempty(end.as_deref()) {
-                validate_calendar_time("end", end)?;
-                if end < start.as_str() {
+            let start = CalendarValue::parse("start", start)?;
+            let end = nonempty(end.as_deref())
+                .map(|value| CalendarValue::parse("end", value))
+                .transpose()?;
+            if let Some(end) = end {
+                if !start.is_comparable_with(end) {
                     return Err(QrError::InvalidField {
                         field: "end",
-                        reason: "must not be before start".to_owned(),
+                        reason: "must use the same value type and UTC/floating form as start"
+                            .to_owned(),
+                    });
+                }
+                if end <= start {
+                    return Err(QrError::InvalidField {
+                        field: "end",
+                        reason: "must be after start".to_owned(),
                     });
                 }
             }
+            let mut event_lines = vec![
+                format!("SUMMARY:{}", escape_vcard(title)),
+                start.content_line("DTSTART"),
+            ];
+            if let Some(end) = end {
+                event_lines.push(end.content_line("DTEND"));
+            }
+            push_vcard(&mut event_lines, "LOCATION", location.as_deref());
+            push_vcard(&mut event_lines, "DESCRIPTION", description.as_deref());
+
+            let uid = deterministic_event_uid(&event_lines);
             let mut lines = vec![
                 "BEGIN:VCALENDAR".to_owned(),
                 "VERSION:2.0".to_owned(),
                 "PRODID:-//Honest QR Code//API//EN".to_owned(),
                 "BEGIN:VEVENT".to_owned(),
-                format!("SUMMARY:{}", escape_vcard(title)),
-                format!("DTSTART:{}", normalize_calendar_time(start)),
+                format!("UID:{uid}"),
+                "DTSTAMP:19700101T000000Z".to_owned(),
             ];
-            if let Some(end) = nonempty(end.as_deref()) {
-                lines.push(format!("DTEND:{}", normalize_calendar_time(end)));
-            }
-            push_vcard(&mut lines, "LOCATION", location.as_deref());
-            push_vcard(&mut lines, "DESCRIPTION", description.as_deref());
+            lines.extend(event_lines);
             lines.push("END:VEVENT".to_owned());
             lines.push("END:VCALENDAR".to_owned());
-            lines.join("\r\n").into_bytes()
+            serialize_content_lines(&lines).into_bytes()
         }
     };
     Ok(payload)
@@ -684,49 +701,286 @@ fn normalize_phone(value: &str) -> Result<String, QrError> {
 }
 
 fn validate_email(value: &str) -> Result<(), QrError> {
+    validate_mailbox(value).map(|_| ())
+}
+
+fn validate_mailbox(value: &str) -> Result<&str, QrError> {
     let trimmed = value.trim();
-    let (local, domain) = trimmed.split_once('@').unwrap_or_default();
-    if local.is_empty()
-        || domain.is_empty()
-        || domain.starts_with('.')
-        || domain.ends_with('.')
-        || !domain.contains('.')
-        || trimmed.chars().any(char::is_whitespace)
-    {
-        return Err(QrError::InvalidField {
-            field: "email",
-            reason: "expected a valid email address".to_owned(),
-        });
+    let invalid_email = || QrError::InvalidField {
+        field: "email",
+        reason: "expected one valid ASCII dot-atom email address".to_owned(),
+    };
+    if trimmed != value || !trimmed.is_ascii() || trimmed.len() > 254 {
+        return Err(invalid_email());
     }
-    Ok(())
+
+    let mut parts = trimmed.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(invalid_email());
+    };
+    let valid_local = !local.is_empty()
+        && local.len() <= 64
+        && !local.starts_with('.')
+        && !local.ends_with('.')
+        && !local.contains("..")
+        && local.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                        | b'.'
+                )
+        });
+    let valid_domain = domain.contains('.')
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    if !valid_local || !valid_domain {
+        return Err(invalid_email());
+    }
+    Ok(trimmed)
 }
 
-fn validate_calendar_time(field: &'static str, value: &str) -> Result<(), QrError> {
-    let compact = normalize_calendar_time(value);
-    let valid = matches!(compact.len(), 8 | 15 | 16)
-        && compact
-            .chars()
-            .enumerate()
-            .all(|(index, character)| match (compact.len(), index) {
-                (15 | 16, 8) => character == 'T',
-                (16, 15) => character == 'Z',
-                _ => character.is_ascii_digit(),
-            });
-    if !valid {
-        return Err(QrError::InvalidField {
-            field,
-            reason: "expected YYYYMMDD, YYYYMMDDTHHMMSS, or an ISO-like equivalent".to_owned(),
-        });
+fn percent_encode_mailbox(mailbox: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(mailbox.len());
+    for byte in mailbox.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'@') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
     }
-    Ok(())
+    encoded
 }
 
-fn normalize_calendar_time(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .filter(|character| !matches!(character, '-' | ':' | ' '))
-        .collect()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CalendarDate {
+    year: u16,
+    month: u8,
+    day: u8,
+}
+
+impl CalendarDate {
+    fn parse(value: &str) -> Option<Self> {
+        if !value.is_ascii() {
+            return None;
+        }
+        let digits = match value.as_bytes() {
+            [year @ .., b'-', _, _, b'-', _, _] if year.len() == 4 => {
+                let mut compact = [0_u8; 8];
+                compact[..4].copy_from_slice(year);
+                compact[4..6].copy_from_slice(&value.as_bytes()[5..7]);
+                compact[6..].copy_from_slice(&value.as_bytes()[8..10]);
+                compact
+            }
+            bytes if bytes.len() == 8 => bytes.try_into().ok()?,
+            _ => return None,
+        };
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let year = parse_decimal(&digits[..4])?;
+        let month = u8::try_from(parse_decimal(&digits[4..6])?).ok()?;
+        let day = u8::try_from(parse_decimal(&digits[6..8])?).ok()?;
+        let days_in_month = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if is_leap_year(year) => 29,
+            2 => 28,
+            _ => return None,
+        };
+        if year == 0 || day == 0 || day > days_in_month {
+            return None;
+        }
+        Some(Self { year, month, day })
+    }
+
+    fn compact(self) -> String {
+        format!("{:04}{:02}{:02}", self.year, self.month, self.day)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CalendarDateTime {
+    date: CalendarDate,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    utc: bool,
+}
+
+impl CalendarDateTime {
+    fn parse(value: &str) -> Option<Self> {
+        if !value.is_ascii() {
+            return None;
+        }
+        let (value, utc) = value
+            .strip_suffix('Z')
+            .map_or((value, false), |value| (value, true));
+        let (date, time) = match value.len() {
+            15 if value.as_bytes()[8] == b'T' => (&value[..8], &value[9..]),
+            19 if value.as_bytes()[10] == b'T' => (&value[..10], &value[11..]),
+            _ => return None,
+        };
+        let date = CalendarDate::parse(date)?;
+        let time_digits: [u8; 6] = match time.as_bytes() {
+            bytes if bytes.len() == 6 => bytes.try_into().ok()?,
+            [hour @ .., b':', _, _, b':', _, _] if hour.len() == 2 => {
+                let mut compact = [0_u8; 6];
+                compact[..2].copy_from_slice(hour);
+                compact[2..4].copy_from_slice(&time.as_bytes()[3..5]);
+                compact[4..].copy_from_slice(&time.as_bytes()[6..8]);
+                compact
+            }
+            _ => return None,
+        };
+        if !time_digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let hour = u8::try_from(parse_decimal(&time_digits[..2])?).ok()?;
+        let minute = u8::try_from(parse_decimal(&time_digits[2..4])?).ok()?;
+        let second = u8::try_from(parse_decimal(&time_digits[4..6])?).ok()?;
+        // RFC 5545's TIME grammar permits seconds 00-60. Determining whether
+        // 60 denotes an actual positive leap second requires historical and
+        // future timezone/leap-second data, so this parser validates syntax
+        // consistently and preserves the supplied value.
+        if hour > 23 || minute > 59 || second > 60 {
+            return None;
+        }
+        Some(Self {
+            date,
+            hour,
+            minute,
+            second,
+            utc,
+        })
+    }
+
+    fn compact(self) -> String {
+        format!(
+            "{}T{:02}{:02}{:02}{}",
+            self.date.compact(),
+            self.hour,
+            self.minute,
+            self.second,
+            if self.utc { "Z" } else { "" }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CalendarValue {
+    Date(CalendarDate),
+    DateTime(CalendarDateTime),
+}
+
+impl CalendarValue {
+    fn parse(field: &'static str, value: &str) -> Result<Self, QrError> {
+        let value = value.trim();
+        CalendarDate::parse(value)
+            .map(Self::Date)
+            .or_else(|| CalendarDateTime::parse(value).map(Self::DateTime))
+            .ok_or_else(|| QrError::InvalidField {
+                field,
+                reason: concat!(
+                    "expected a real date or time in YYYYMMDD, YYYY-MM-DD, ",
+                    "YYYYMMDDTHHMMSS[Z], or YYYY-MM-DDTHH:MM:SS[Z] form"
+                )
+                .to_owned(),
+            })
+    }
+
+    const fn is_comparable_with(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Date(_), Self::Date(_)) => true,
+            (Self::DateTime(left), Self::DateTime(right)) => left.utc == right.utc,
+            _ => false,
+        }
+    }
+
+    fn content_line(self, name: &str) -> String {
+        match self {
+            Self::Date(date) => format!("{name};VALUE=DATE:{}", date.compact()),
+            Self::DateTime(date_time) => format!("{name}:{}", date_time.compact()),
+        }
+    }
+}
+
+fn parse_decimal(bytes: &[u8]) -> Option<u16> {
+    bytes.iter().try_fold(0_u16, |value, byte| {
+        value
+            .checked_mul(10)?
+            .checked_add(u16::from(byte.checked_sub(b'0')?))
+    })
+}
+
+const fn is_leap_year(year: u16) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+fn deterministic_event_uid(content_lines: &[String]) -> String {
+    let mut digest = Sha256::new();
+    for line in content_lines {
+        digest.update(line.len().to_be_bytes());
+        digest.update(line.as_bytes());
+    }
+    format!("{}@honestqrcode.com", hex::encode(digest.finalize()))
+}
+
+fn serialize_content_lines(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| fold_content_line(line))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+fn fold_content_line(line: &str) -> String {
+    let mut folded = String::with_capacity(line.len() + (line.len() / 74 * 3));
+    let mut remainder = line;
+    let mut first = true;
+    while !remainder.is_empty() {
+        let capacity = if first { 75 } else { 74 };
+        let mut split = remainder.len().min(capacity);
+        while !remainder.is_char_boundary(split) {
+            split -= 1;
+        }
+        if !first {
+            folded.push_str("\r\n ");
+        }
+        folded.push_str(&remainder[..split]);
+        remainder = &remainder[split..];
+        first = false;
+    }
+    folded
 }
 
 fn percent_encode_component(value: &str) -> String {
@@ -745,12 +999,30 @@ fn escape_wifi(value: &str) -> String {
 }
 
 fn escape_vcard(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace(';', "\\;")
-        .replace(',', "\\,")
-        .replace("\r\n", "\\n")
-        .replace(['\r', '\n'], "\\n")
+    let mut escaped = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                escaped.push_str("\\n");
+            }
+            '\n' => escaped.push_str("\\n"),
+            '\\' | ';' | ',' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            // RFC 5545 TEXT values cannot contain control characters other
+            // than horizontal tab. Replace them visibly instead of emitting
+            // octets that can truncate or corrupt downstream parsers.
+            '\t' => escaped.push('\t'),
+            character if character.is_control() => escaped.push('\u{fffd}'),
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn push_vcard(lines: &mut Vec<String>, name: &str, value: Option<&str>) {
@@ -884,6 +1156,202 @@ mod tests {
             String::from_utf8(payload_bytes(&data).expect("event payload")).expect("UTF-8");
         assert!(payload.starts_with("BEGIN:VCALENDAR\r\nVERSION:2.0"));
         assert!(payload.contains("DTSTART:20260722T120000Z"));
-        assert!(payload.ends_with("END:VEVENT\r\nEND:VCALENDAR"));
+        assert!(payload.contains("\r\nUID:"));
+        assert!(payload.contains("\r\nDTSTAMP:"));
+        assert!(payload.ends_with("END:VEVENT\r\nEND:VCALENDAR\r\n"));
+    }
+
+    fn event(start: &str, end: Option<&str>) -> QrData {
+        QrData::Event {
+            title: "Launch".to_owned(),
+            start: start.to_owned(),
+            end: end.map(str::to_owned),
+            location: Some("Online".to_owned()),
+            description: Some("Release".to_owned()),
+        }
+    }
+
+    fn payload_string(data: &QrData) -> Result<String, QrError> {
+        payload_bytes(data).map(|payload| String::from_utf8(payload).expect("UTF-8 payload"))
+    }
+
+    #[test]
+    fn event_rejects_impossible_dates_and_times() {
+        for start in [
+            "20260229",
+            "2026-04-31",
+            "2026-00-10",
+            "2026-01-00",
+            "2026-07-22T24:00:00Z",
+            "2026-07-22T12:60:00Z",
+            "2026-07-22T12:00:61Z",
+            "2026-07-22T12:00:0é",
+        ] {
+            assert!(
+                matches!(
+                    payload_bytes(&event(start, None)),
+                    Err(QrError::InvalidField { field: "start", .. })
+                ),
+                "accepted invalid start {start}"
+            );
+        }
+
+        payload_bytes(&event("2024-02-29", None)).expect("leap day is valid");
+    }
+
+    #[test]
+    fn event_accepts_and_preserves_rfc_leap_second() {
+        let payload = payload_string(&event("19970630T235960Z", Some("19970701T000000Z")))
+            .expect("RFC 5545 leap second");
+
+        assert!(payload.contains("DTSTART:19970630T235960Z\r\n"));
+        assert!(payload.contains("DTEND:19970701T000000Z\r\n"));
+
+        let floating = payload_string(&event("1997-06-30T18:29:60", Some("1997-06-30T18:30:00")))
+            .expect("floating leap-second syntax");
+        assert!(floating.contains("DTSTART:19970630T182960\r\n"));
+    }
+
+    #[test]
+    fn event_rejects_mixed_types_and_end_before_start() {
+        for data in [
+            event("2026-07-22", Some("2026-07-22T12:00:00Z")),
+            event("2026-07-22T12:00:00Z", Some("2026-07-22")),
+            event("2026-07-22T12:00:00Z", Some("2026-07-22T13:00:00")),
+            event("2026-07-23", Some("2026-07-22")),
+            event("2026-07-22", Some("2026-07-22")),
+            event("2026-07-22T12:00:00Z", Some("2026-07-22T11:59:59Z")),
+            event("2026-07-22T12:00:00Z", Some("2026-07-22T12:00:00Z")),
+        ] {
+            assert!(matches!(
+                payload_bytes(&data),
+                Err(QrError::InvalidField { field: "end", .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn event_date_values_are_typed_and_equivalent_forms_are_canonical() {
+        let compact = payload_string(&event("20260722", Some("20260723"))).expect("compact");
+        let extended = payload_string(&event("2026-07-22", Some("2026-07-23"))).expect("extended");
+
+        assert_eq!(compact, extended);
+        assert!(compact.contains("DTSTART;VALUE=DATE:20260722"));
+        assert!(compact.contains("DTEND;VALUE=DATE:20260723"));
+    }
+
+    #[test]
+    fn event_datetime_forms_are_canonical_and_output_is_deterministic() {
+        let compact =
+            payload_string(&event("20260722T120000Z", Some("20260722T130000Z"))).expect("compact");
+        let extended = payload_string(&event("2026-07-22T12:00:00Z", Some("2026-07-22T13:00:00Z")))
+            .expect("extended");
+
+        assert_eq!(compact, extended);
+        assert_eq!(
+            compact,
+            payload_string(&event("2026-07-22T12:00:00Z", Some("2026-07-22T13:00:00Z")))
+                .expect("repeat")
+        );
+    }
+
+    #[test]
+    fn event_content_lines_are_folded_without_splitting_utf8() {
+        let data = QrData::Event {
+            title: "Launch — ".repeat(20),
+            start: "20260722".to_owned(),
+            end: None,
+            location: None,
+            description: None,
+        };
+        let payload = payload_string(&data).expect("event payload");
+        let unfolded = payload.replace("\r\n ", "");
+
+        assert!(payload.contains("\r\n "));
+        assert!(unfolded.contains(&format!(
+            "SUMMARY:{}\r\n",
+            escape_vcard(&"Launch — ".repeat(20))
+        )));
+        assert!(
+            payload
+                .split("\r\n")
+                .all(|physical_line| physical_line.len() <= 75)
+        );
+    }
+
+    #[test]
+    fn calendar_text_never_emits_forbidden_control_characters() {
+        let data = QrData::Event {
+            title: "Launch\0\u{7f}\u{85}".to_owned(),
+            start: "20260722".to_owned(),
+            end: None,
+            location: Some("Room\u{1f}".to_owned()),
+            description: Some("Line one\r\nLine two\tTabbed".to_owned()),
+        };
+        let payload = payload_string(&data).expect("sanitized event payload");
+
+        assert!(!payload.chars().any(|character| {
+            character.is_control() && !matches!(character, '\r' | '\n' | '\t')
+        }));
+        assert!(payload.contains("SUMMARY:Launch���\r\n"));
+        assert!(payload.contains("LOCATION:Room�\r\n"));
+        assert!(payload.contains("DESCRIPTION:Line one\\nLine two\tTabbed\r\n"));
+    }
+
+    #[test]
+    fn mailto_normal_address_is_preserved() {
+        let data = QrData::Email {
+            to: "user.name@example.com".to_owned(),
+            subject: None,
+            body: None,
+        };
+
+        assert_eq!(
+            payload_string(&data).expect("mailto"),
+            "mailto:user.name@example.com"
+        );
+    }
+
+    #[test]
+    fn mailto_address_delimiters_are_encoded_once() {
+        let data = QrData::Email {
+            to: "sales&support+qr?code%@example.com".to_owned(),
+            subject: Some("hello".to_owned()),
+            body: None,
+        };
+
+        assert_eq!(
+            payload_string(&data).expect("mailto"),
+            "mailto:sales%26support%2Bqr%3Fcode%25@example.com?subject=hello"
+        );
+    }
+
+    #[test]
+    fn mailto_rejects_recipient_and_query_injection() {
+        for address in [
+            "first@example.com,second@example.com",
+            "first@example.com?subject=injected",
+            "first@example.com&to=second@example.com",
+            "first@example.com;second@example.com",
+            "first@example.com@evil.example",
+            ".leading@example.com",
+            "trailing.@example.com",
+            "double..dot@example.com",
+            "user@-example.com",
+            "user@example-.com",
+        ] {
+            let data = QrData::Email {
+                to: address.to_owned(),
+                subject: None,
+                body: None,
+            };
+            assert!(
+                matches!(
+                    payload_bytes(&data),
+                    Err(QrError::InvalidField { field: "email", .. })
+                ),
+                "accepted malformed mailbox {address}"
+            );
+        }
     }
 }

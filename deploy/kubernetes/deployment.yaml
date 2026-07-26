@@ -20,7 +20,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          image: ghcr.io/honestqrcode/honestqrcode-api:latest
+          image: ghcr.io/honestqrcode/honestqrcode-api:0.1.1
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -64,4 +64,3 @@ spec:
     - name: http
       port: 80
       targetPort: http
-

@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](rust-toolchain.toml)
 
-Honest QR Code API turns text and structured data into PNG, SVG, or a JSON module matrix. It stores nothing, makes no outbound requests, and never logs QR payloads. Run the same rendering engine as an HTTP server, a tiny container, an AWS Lambda function, a CLI, or a Rust library.
+Honest QR Code API turns text and structured data into PNG, SVG, or a JSON module matrix. It stores nothing, makes no outbound requests, and its application tracing records only HTTP methods and paths—never request bodies or query strings. Run the same rendering engine as an HTTP server, a tiny container, an AWS Lambda function, a CLI, or a Rust library.
 
 The browser-only generator at [honestqrcode.com](https://honestqrcode.com/) remains free, private, and independent of this API.
 
@@ -24,7 +24,7 @@ The browser-only generator at [honestqrcode.com](https://honestqrcode.com/) rema
 ### Container
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/honestqrcode/honestqrcode-api:latest
+docker run --rm -p 8080:8080 ghcr.io/honestqrcode/honestqrcode-api:0.1.1
 curl "http://localhost:8080/v1/qr?data=Hello%20world" --output hello.png
 ```
 
@@ -42,6 +42,10 @@ cargo run --release -p honestqr-cli -- "https://honestqrcode.com" -o honest.png
 ```
 
 The server listens on `0.0.0.0:8080`. Open <http://localhost:8080/docs> for the built-in docs or <http://localhost:8080/openapi.json> for OpenAPI 3.1.
+
+Container releases use protected SemVer tags and the release workflow refuses
+to overwrite an existing image tag. There is intentionally no mutable
+`latest` tag.
 
 ## API
 
@@ -104,12 +108,21 @@ The authoritative schema and every payload variant are in the generated [OpenAPI
 | `HONESTQR_PORT` | `8080` | Listen port |
 | `HONESTQR_MAX_BODY_BYTES` | `65536` | Maximum JSON request size |
 | `HONESTQR_MAX_BATCH_ITEMS` | `100` | Maximum batch size |
-| `HONESTQR_MAX_CONCURRENCY` | `64` | Maximum in-flight rendering requests |
+| `HONESTQR_MAX_CONCURRENCY` | `8` | Maximum in-flight rendering requests (safe range: 1–64) |
 | `HONESTQR_REQUEST_TIMEOUT_SECONDS` | `15` | Rendering request deadline |
 | `HONESTQR_JSON_LOGS` | `false` | Emit production-friendly JSON logs |
 | `RUST_LOG` | `honestqr=info,tower_http=info` | Log filter |
 
 Put authentication, quotas, and TLS at your gateway or reverse proxy. The service deliberately has no user database or credential store.
+
+The standard runtime profile admits at most 64 MiB of estimated active render
+work, leaving headroom in the supplied 128 MiB Kubernetes pod. Requests that
+would exceed the per-request budget receive JSON `413`; requests that arrive
+while the shared budget is occupied receive JSON `429`. A timed-out blocking
+render retains its reservation until the worker actually stops, and batches
+render directly into their ZIP archive one item at a time. Rendered artifacts
+are sent in bounded chunks and keep their reservation until the response body
+is consumed or disconnected, so slow clients remain inside the same budget.
 
 ## Deployment
 

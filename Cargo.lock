@@ -719,7 +719,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "honestqr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "honestqr-core",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "honestqr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "criterion",
@@ -746,10 +746,11 @@ dependencies = [
 
 [[package]]
 name = "honestqr-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "base64",
+ "futures-core",
  "honestqr-core",
  "http",
  "http-body-util",
@@ -766,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "honestqr-lambda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "honestqr-http",
@@ -779,11 +780,12 @@ dependencies = [
 
 [[package]]
 name = "honestqr-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "clap",
  "honestqr-http",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

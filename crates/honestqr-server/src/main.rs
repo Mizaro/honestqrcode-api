@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 
 use clap::Parser;
-use honestqr_http::{AppConfig, router};
+use honestqr_http::{AppConfig, try_router};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -53,12 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local_address = listener.local_addr()?;
     info!(address = %local_address, "Honest QR Code API listening");
 
-    let app = router(AppConfig {
+    let app = try_router(AppConfig {
         max_body_bytes: args.max_body_bytes,
         max_batch_items: args.max_batch_items,
         max_concurrency: args.max_concurrency,
         request_timeout_seconds: args.request_timeout_seconds,
-    });
+    })?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -80,6 +80,31 @@ fn init_tracing(json: bool) {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install Ctrl-C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
     info!("shutdown signal received");
 }

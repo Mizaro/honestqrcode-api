@@ -736,11 +736,7 @@ fn render_png(
             if colors[index] != ModuleColor::Dark {
                 continue;
             }
-            image.put_pixel(
-                x + margin_modules,
-                y + margin_modules,
-                foreground_luma,
-            );
+            image.put_pixel(x + margin_modules, y + margin_modules, foreground_luma);
         }
     }
 

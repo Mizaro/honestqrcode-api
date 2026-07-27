@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use honestqr_core::{ErrorCorrection, QrData, QrFormat, QrSpec, RenderOptions, render};
+use honestqr_core::{ErrorCorrection, Margin, QrData, QrFormat, QrSpec, RenderOptions, Width, render};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -61,8 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data: QrData::Text { value: data },
             render: RenderOptions {
                 format: args.format.into(),
-                width: args.width,
-                margin: args.margin,
+                width: Width::try_from(args.width)?,
+                margin: Margin::try_from(args.margin)?,
                 error_correction: args.error_correction.into(),
                 foreground: args.foreground,
                 background: args.background,
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output = args
         .output
-        .unwrap_or_else(|| PathBuf::from(format!("qr.{}", artifact.metadata.extension)));
+        .unwrap_or_else(|| PathBuf::from(format!("qr.{}", artifact.metadata.extension())));
     if output.as_os_str() == "-" {
         std::io::stdout().lock().write_all(&artifact.bytes)?;
     } else {

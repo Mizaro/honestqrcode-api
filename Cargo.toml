@@ -11,7 +11,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/honestqrcode/honestqrcode-api"
 homepage = "https://honestqrcode.com/"
@@ -20,6 +20,7 @@ authors = ["Mizaro"]
 [workspace.dependencies]
 axum = { version = "0.8.9", features = ["json"] }
 base64 = "0.22.1"
+bytes = "1.10.1"
 clap = { version = "4.5.53", features = ["derive", "env"] }
 futures-core = "0.3.33"
 hex = "0.4.3"

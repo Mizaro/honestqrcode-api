@@ -20,8 +20,6 @@ fn render_benchmarks(criterion: &mut Criterion) {
                 },
                 render: RenderOptions {
                     format,
-                    width: 512,
-                    error_correction: ErrorCorrection::Medium,
                     ..RenderOptions::default()
                 },
             };

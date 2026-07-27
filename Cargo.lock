@@ -140,7 +140,7 @@ version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d02c123e89527e7b424f74f52d11be0d17ef2887819323a42dcae1c7630ca53d"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "http",
  "http-body",
@@ -207,6 +207,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
 
 [[package]]
 name = "bitflags"
@@ -730,7 +736,7 @@ dependencies = [
 name = "honestqr-core"
 version = "0.1.1"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "criterion",
  "hex",
  "image",
@@ -749,7 +755,7 @@ name = "honestqr-http"
 version = "0.1.1"
 dependencies = [
  "axum",
- "base64",
+ "base64 0.23.0",
  "bytes",
  "futures-core",
  "honestqr-core",
@@ -1088,7 +1094,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "484647f147899f866a7b5db6aaa1671e943f89f4be76e2a383c96b1b27058294"
 dependencies = [
  "async-stream",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "http",

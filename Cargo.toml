@@ -19,7 +19,7 @@ authors = ["Mizaro"]
 
 [workspace.dependencies]
 axum = { version = "0.8.9", features = ["json"] }
-base64 = "0.22.1"
+base64 = "0.23.0"
 bytes = "1.10.1"
 clap = { version = "4.5.53", features = ["derive", "env"] }
 futures-core = "0.3.33"

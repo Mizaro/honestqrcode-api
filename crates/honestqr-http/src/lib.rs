@@ -680,12 +680,13 @@ impl From<std::io::Error> for BatchArchiveError {
     }
 }
 
-fn write_zip_archive<W: Write + Seek>(
+fn write_zip_archive<W: Read + Write + Seek>(
     writer: &mut W,
     specs: &[QrSpec],
     cancellation: &Cancellation,
 ) -> Result<(), BatchArchiveError> {
     let mut archive = ZipWriter::new(writer);
+    archive.set_flush_on_finish_file(true);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o644);
@@ -703,14 +704,6 @@ fn write_zip_archive<W: Write + Seek>(
         let filename = format!("qr-{:03}.{}", index + 1, artifact.metadata.extension());
         archive.start_file(&filename, options)?;
         archive.write_all(&artifact.bytes)?;
-        // SAFETY: flushing the underlying writer does not interleave with zip
-        // framing because the archive is not writing while this runs.
-        unsafe {
-            archive
-                .get_mut()
-                .ok_or_else(|| std::io::Error::other("zip writer unavailable"))?
-                .flush()?;
-        }
         manifest_items.push(BatchManifestItem {
             index,
             filename,
@@ -725,13 +718,6 @@ fn write_zip_archive<W: Write + Seek>(
     })
     .map_err(|_| BatchArchiveError::Manifest)?;
     archive.write_all(&manifest)?;
-    // SAFETY: see the flush call in the per-item loop above.
-    unsafe {
-        archive
-            .get_mut()
-            .ok_or_else(|| std::io::Error::other("zip writer unavailable"))?
-            .flush()?;
-    }
     archive.finish()?;
     Ok(())
 }

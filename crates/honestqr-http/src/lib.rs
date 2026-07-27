@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_core::Stream;
 use honestqr_core::{
-    ErrorCorrection, Margin, MAX_WIDTH, MIN_WIDTH, QrArtifact, QrData, QrError, QrFormat,
+    ErrorCorrection, MAX_WIDTH, MIN_WIDTH, Margin, QrArtifact, QrData, QrError, QrFormat,
     QrMetadata, QrSpec, RenderOptions, Width, render_validated,
 };
 use prometheus_client::encoding::text::encode;
@@ -164,7 +164,8 @@ impl Metrics {
 /// Construct the complete HTTP adapter. The same router is used by integration
 /// tests with safe default configuration.
 pub fn router(config: AppConfig) -> Router {
-    try_router(config).unwrap_or_else(|error| panic!("invalid honestqr HTTP configuration: {error}"))
+    try_router(config)
+        .unwrap_or_else(|error| panic!("invalid honestqr HTTP configuration: {error}"))
 }
 
 /// Construct the HTTP adapter after validating that its limits are safe for
@@ -398,7 +399,10 @@ async fn ready() -> Response {
             ..RenderOptions::default()
         },
     };
-    match spec.validate().and_then(|validated| render_validated(&validated)) {
+    match spec
+        .validate()
+        .and_then(|validated| render_validated(&validated))
+    {
         Ok(_) => (StatusCode::OK, "ready\n").into_response(),
         Err(error) => {
             warn!(error = %error, "readiness render failed");

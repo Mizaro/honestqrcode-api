@@ -438,11 +438,9 @@ impl QrSpec {
 
 /// Render a QR artifact from a validated specification.
 pub fn render_validated(spec: &ValidatedQrSpec) -> Result<QrArtifact, QrError> {
-    let code = QrCode::with_error_correction_level(
-        &spec.payload,
-        spec.render.error_correction.into(),
-    )
-    .map_err(|_| QrError::DataOverflow)?;
+    let code =
+        QrCode::with_error_correction_level(&spec.payload, spec.render.error_correction.into())
+            .map_err(|_| QrError::DataOverflow)?;
     let module_count = u32::try_from(code.width()).map_err(|_| QrError::DataOverflow)?;
     let total_modules = module_count + (u32::from(spec.render.margin.get()) * 2);
     let scale = spec.render.width.get() / total_modules;
@@ -727,9 +725,8 @@ fn render_png(
     let mut image = RgbaImage::from_pixel(actual_width, actual_width, background);
     let margin_pixels = u32::from(margin.get()) * scale;
     let colors = code.to_colors();
-    let stride = usize::try_from(actual_width)
-        .map_err(|_| QrError::RenderFailed { format: "PNG" })?
-        * 4;
+    let stride =
+        usize::try_from(actual_width).map_err(|_| QrError::RenderFailed { format: "PNG" })? * 4;
     let pixels = image.as_mut();
     let foreground_bytes = foreground.0;
 
@@ -742,11 +739,12 @@ fn render_png(
             }
             let start_x = margin_pixels + (x * scale);
             let start_y = margin_pixels + (y * scale);
-            let start_x = usize::try_from(start_x)
-                .map_err(|_| QrError::RenderFailed { format: "PNG" })?;
-            let start_y = usize::try_from(start_y)
-                .map_err(|_| QrError::RenderFailed { format: "PNG" })?;
-            let scale = usize::try_from(scale).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
+            let start_x =
+                usize::try_from(start_x).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
+            let start_y =
+                usize::try_from(start_y).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
+            let scale =
+                usize::try_from(scale).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
             for row_offset in 0..scale {
                 let row_start = (start_y + row_offset) * stride + start_x * 4;
                 for column in 0..scale {

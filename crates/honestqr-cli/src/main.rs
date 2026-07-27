@@ -2,7 +2,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use honestqr_core::{ErrorCorrection, Margin, QrData, QrFormat, QrSpec, RenderOptions, Width, render};
+use honestqr_core::{
+    ErrorCorrection, Margin, QrData, QrFormat, QrSpec, RenderOptions, Width, render,
+};
 
 #[derive(Debug, Parser)]
 #[command(

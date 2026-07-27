@@ -10,7 +10,9 @@ use std::io::Cursor;
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use qrcode::{EcLevel, QrCode, types::Color as ModuleColor};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::{Url, form_urlencoded};
@@ -20,6 +22,84 @@ pub const MAX_PAYLOAD_BYTES: usize = 2_953;
 pub const MIN_WIDTH: u32 = 64;
 pub const MAX_WIDTH: u32 = 4_096;
 pub const MAX_MARGIN: u8 = 32;
+/// Maximum base64 input length that can decode to [`MAX_PAYLOAD_BYTES`].
+const MAX_BASE64_ENCODED_BYTES: usize = MAX_PAYLOAD_BYTES.div_ceil(3) * 4;
+
+/// Requested output width in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Width(u32);
+
+/// Quiet-zone margin in modules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Margin(u8);
+
+impl Width {
+    const fn new_unchecked(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl Margin {
+    const fn new_unchecked(value: u8) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for Width {
+    type Error = QrError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if (MIN_WIDTH..=MAX_WIDTH).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(QrError::InvalidWidth)
+        }
+    }
+}
+
+impl TryFrom<u8> for Margin {
+    type Error = QrError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value <= MAX_MARGIN {
+            Ok(Self(value))
+        } else {
+            Err(QrError::InvalidMargin)
+        }
+    }
+}
+
+impl Serialize for Width {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl Serialize for Margin {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Width {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Width::try_from(u32::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for Margin {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Margin::try_from(u8::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QrSpec {
@@ -30,6 +110,7 @@ pub struct QrSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum QrData {
     Text {
         value: String,
@@ -101,6 +182,7 @@ pub enum QrData {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum WifiSecurity {
     #[default]
     Wpa,
@@ -113,9 +195,11 @@ pub struct RenderOptions {
     #[serde(default)]
     pub format: QrFormat,
     #[serde(default = "default_width")]
-    pub width: u32,
+    #[schema(value_type = u32)]
+    pub width: Width,
     #[serde(default = "default_margin")]
-    pub margin: u8,
+    #[schema(value_type = u8)]
+    pub margin: Margin,
     #[serde(default)]
     pub error_correction: ErrorCorrection,
     #[serde(default = "default_foreground")]
@@ -137,12 +221,12 @@ impl Default for RenderOptions {
     }
 }
 
-const fn default_width() -> u32 {
-    512
+const fn default_width() -> Width {
+    Width::new_unchecked(512)
 }
 
-const fn default_margin() -> u8 {
-    4
+const fn default_margin() -> Margin {
+    Margin::new_unchecked(4)
 }
 
 fn default_foreground() -> String {
@@ -155,6 +239,7 @@ fn default_background() -> String {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum QrFormat {
     #[default]
     Png,
@@ -182,6 +267,7 @@ impl QrFormat {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ErrorCorrection {
     Low,
     #[default]
@@ -201,16 +287,72 @@ impl From<ErrorCorrection> for EcLevel {
     }
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, ToSchema)]
+#[schema(as = QrMetadataSchema)]
 pub struct QrMetadata {
-    pub content_type: String,
-    pub extension: String,
+    pub format: QrFormat,
     pub width: u32,
     pub height: u32,
     pub modules: u32,
     pub version: u8,
     pub payload_bytes: usize,
     pub sha256: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct QrMetadataSchema {
+    content_type: String,
+    extension: String,
+    width: u32,
+    height: u32,
+    modules: u32,
+    version: u8,
+    payload_bytes: usize,
+    sha256: String,
+}
+
+impl QrMetadata {
+    pub const fn content_type(&self) -> &'static str {
+        self.format.content_type()
+    }
+
+    pub const fn extension(&self) -> &'static str {
+        self.format.extension()
+    }
+}
+
+impl Serialize for QrMetadata {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("QrMetadata", 8)?;
+        state.serialize_field("content_type", self.content_type())?;
+        state.serialize_field("extension", self.extension())?;
+        state.serialize_field("width", &self.width)?;
+        state.serialize_field("height", &self.height)?;
+        state.serialize_field("modules", &self.modules)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("payload_bytes", &self.payload_bytes)?;
+        state.serialize_field("sha256", &self.sha256)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedQrSpec {
+    payload: Vec<u8>,
+    render: ValidatedRenderOptions,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedRenderOptions {
+    format: QrFormat,
+    width: Width,
+    margin: Margin,
+    error_correction: ErrorCorrection,
+    foreground: String,
+    background: String,
+    foreground_rgba: Rgba<u8>,
+    background_rgba: Rgba<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,38 +396,58 @@ impl QrError {
     }
 }
 
-/// Render a QR artifact from a complete, transport-independent specification.
-pub fn render(spec: &QrSpec) -> Result<QrArtifact, QrError> {
-    validate_render_options(&spec.render)?;
-    let payload = payload_bytes(&spec.data)?;
-    if payload.is_empty() {
-        return Err(QrError::EmptyPayload);
-    }
-    if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err(QrError::PayloadTooLarge {
-            actual: payload.len(),
-            maximum: MAX_PAYLOAD_BYTES,
-        });
-    }
+impl QrSpec {
+    /// Validate the specification and precompute the encoded payload.
+    pub fn validate(&self) -> Result<ValidatedQrSpec, QrError> {
+        validate_render_options(&self.render)?;
+        let payload = payload_bytes(&self.data)?;
+        if payload.is_empty() {
+            return Err(QrError::EmptyPayload);
+        }
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(QrError::PayloadTooLarge {
+                actual: payload.len(),
+                maximum: MAX_PAYLOAD_BYTES,
+            });
+        }
 
-    let code = QrCode::with_error_correction_level(&payload, spec.render.error_correction.into())
-        .map_err(|_| QrError::DataOverflow)?;
+        let foreground = parse_color("foreground", &self.render.foreground)?;
+        let background = parse_color("background", &self.render.background)?;
+        if foreground == background {
+            return Err(QrError::InvalidField {
+                field: "colors",
+                reason: "foreground and background must differ".to_owned(),
+            });
+        }
+
+        Ok(ValidatedQrSpec {
+            payload,
+            render: ValidatedRenderOptions {
+                format: self.render.format,
+                width: self.render.width,
+                margin: self.render.margin,
+                error_correction: self.render.error_correction,
+                foreground: self.render.foreground.clone(),
+                background: self.render.background.clone(),
+                foreground_rgba: foreground,
+                background_rgba: background,
+            },
+        })
+    }
+}
+
+/// Render a QR artifact from a validated specification.
+pub fn render_validated(spec: &ValidatedQrSpec) -> Result<QrArtifact, QrError> {
+    let code =
+        QrCode::with_error_correction_level(&spec.payload, spec.render.error_correction.into())
+            .map_err(|_| QrError::DataOverflow)?;
     let module_count = u32::try_from(code.width()).map_err(|_| QrError::DataOverflow)?;
-    let total_modules = module_count + (u32::from(spec.render.margin) * 2);
-    let scale = spec.render.width / total_modules;
+    let total_modules = module_count + (u32::from(spec.render.margin.get()) * 2);
+    let scale = spec.render.width.get() / total_modules;
     if scale == 0 {
         return Err(QrError::WidthTooSmall);
     }
     let actual_width = total_modules * scale;
-    let foreground = parse_color("foreground", &spec.render.foreground)?;
-    let background = parse_color("background", &spec.render.background)?;
-
-    if foreground == background {
-        return Err(QrError::InvalidField {
-            field: "colors",
-            reason: "foreground and background must differ".to_owned(),
-        });
-    }
 
     let bytes = match spec.render.format {
         QrFormat::Png => render_png(
@@ -294,8 +456,8 @@ pub fn render(spec: &QrSpec) -> Result<QrArtifact, QrError> {
             actual_width,
             scale,
             spec.render.margin,
-            foreground,
-            background,
+            spec.render.foreground_rgba,
+            spec.render.background_rgba,
         )?,
         QrFormat::Svg => render_svg(
             &code,
@@ -304,7 +466,7 @@ pub fn render(spec: &QrSpec) -> Result<QrArtifact, QrError> {
             spec.render.margin,
             &spec.render.foreground,
             &spec.render.background,
-        )
+        )?
         .into_bytes(),
         QrFormat::Matrix => render_matrix(&code, module_count)?,
     };
@@ -316,25 +478,25 @@ pub fn render(spec: &QrSpec) -> Result<QrArtifact, QrError> {
     Ok(QrArtifact {
         bytes,
         metadata: QrMetadata {
-            content_type: spec.render.format.content_type().to_owned(),
-            extension: spec.render.format.extension().to_owned(),
+            format: spec.render.format,
             width: actual_width,
             height: actual_width,
             modules: module_count,
             version,
-            payload_bytes: payload.len(),
+            payload_bytes: spec.payload.len(),
             sha256,
         },
     })
 }
 
+/// Render a QR artifact from a complete, transport-independent specification.
+pub fn render(spec: &QrSpec) -> Result<QrArtifact, QrError> {
+    render_validated(&spec.validate()?)
+}
+
 fn validate_render_options(options: &RenderOptions) -> Result<(), QrError> {
-    if !(MIN_WIDTH..=MAX_WIDTH).contains(&options.width) {
-        return Err(QrError::InvalidWidth);
-    }
-    if options.margin > MAX_MARGIN {
-        return Err(QrError::InvalidMargin);
-    }
+    Width::try_from(options.width.get()).map_err(|_| QrError::InvalidWidth)?;
+    Margin::try_from(options.margin.get()).map_err(|_| QrError::InvalidMargin)?;
     Ok(())
 }
 
@@ -351,12 +513,7 @@ fn payload_bytes(data: &QrData) -> Result<Vec<u8>, QrError> {
             }
             parsed.as_str().as_bytes().to_vec()
         }
-        QrData::Bytes { base64 } => {
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD
-                .decode(base64)
-                .map_err(|error| invalid("base64", error))?
-        }
+        QrData::Bytes { base64 } => decode_bounded_base64(base64)?,
         QrData::Wifi {
             ssid,
             password,
@@ -455,19 +612,18 @@ fn payload_bytes(data: &QrData) -> Result<Vec<u8>, QrError> {
                 }
             }
 
-            let mut lines = vec![
-                "BEGIN:VCARD".to_owned(),
-                "VERSION:3.0".to_owned(),
-                format!(
-                    "N:{};{};;;",
-                    escape_vcard(last_name),
-                    escape_vcard(first_name)
-                ),
-                format!(
-                    "FN:{}",
-                    escape_vcard(format!("{first_name} {last_name}").trim())
-                ),
-            ];
+            let mut lines = Vec::with_capacity(12);
+            lines.push("BEGIN:VCARD".to_owned());
+            lines.push("VERSION:3.0".to_owned());
+            lines.push(format!(
+                "N:{};{};;;",
+                escape_vcard(last_name),
+                escape_vcard(first_name)
+            ));
+            lines.push(format!(
+                "FN:{}",
+                escape_vcard(format!("{first_name} {last_name}").trim())
+            ));
             push_vcard(&mut lines, "ORG", organization.as_deref());
             push_vcard(&mut lines, "EMAIL", email.as_deref());
             push_vcard(&mut lines, "TEL", phone.as_deref());
@@ -562,13 +718,17 @@ fn render_png(
     module_count: u32,
     actual_width: u32,
     scale: u32,
-    margin: u8,
+    margin: Margin,
     foreground: Rgba<u8>,
     background: Rgba<u8>,
 ) -> Result<Vec<u8>, QrError> {
     let mut image = RgbaImage::from_pixel(actual_width, actual_width, background);
-    let margin_pixels = u32::from(margin) * scale;
+    let margin_pixels = u32::from(margin.get()) * scale;
     let colors = code.to_colors();
+    let stride =
+        usize::try_from(actual_width).map_err(|_| QrError::RenderFailed { format: "PNG" })? * 4;
+    let pixels = image.as_mut();
+    let foreground_bytes = foreground.0;
 
     for y in 0..module_count {
         for x in 0..module_count {
@@ -579,9 +739,17 @@ fn render_png(
             }
             let start_x = margin_pixels + (x * scale);
             let start_y = margin_pixels + (y * scale);
-            for pixel_y in start_y..start_y + scale {
-                for pixel_x in start_x..start_x + scale {
-                    image.put_pixel(pixel_x, pixel_y, foreground);
+            let start_x =
+                usize::try_from(start_x).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
+            let start_y =
+                usize::try_from(start_y).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
+            let scale =
+                usize::try_from(scale).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
+            for row_offset in 0..scale {
+                let row_start = (start_y + row_offset) * stride + start_x * 4;
+                for column in 0..scale {
+                    let idx = row_start + column * 4;
+                    pixels[idx..idx + 4].copy_from_slice(&foreground_bytes);
                 }
             }
         }
@@ -598,25 +766,27 @@ fn render_svg(
     code: &QrCode,
     module_count: u32,
     actual_width: u32,
-    margin: u8,
+    margin: Margin,
     foreground: &str,
     background: &str,
-) -> String {
-    let total = module_count + (u32::from(margin) * 2);
+) -> Result<String, QrError> {
+    let total = module_count + (u32::from(margin.get()) * 2);
     let colors = code.to_colors();
     let mut path = String::with_capacity(colors.len() * 4);
 
     for y in 0..module_count {
         let mut x = 0;
         while x < module_count {
-            let index = usize::try_from(y * module_count + x).unwrap_or_default();
+            let index = usize::try_from(y * module_count + x)
+                .map_err(|_| QrError::RenderFailed { format: "SVG" })?;
             if colors[index] != ModuleColor::Dark {
                 x += 1;
                 continue;
             }
             let start = x;
             while x < module_count {
-                let run_index = usize::try_from(y * module_count + x).unwrap_or_default();
+                let run_index = usize::try_from(y * module_count + x)
+                    .map_err(|_| QrError::RenderFailed { format: "SVG" })?;
                 if colors[run_index] != ModuleColor::Dark {
                     break;
                 }
@@ -626,15 +796,15 @@ fn render_svg(
             let _ = write!(
                 path,
                 "M{} {}h{}v1h-{}z",
-                start + u32::from(margin),
-                y + u32::from(margin),
+                start + u32::from(margin.get()),
+                y + u32::from(margin.get()),
                 run,
                 run
             );
         }
     }
 
-    format!(
+    Ok(format!(
         concat!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" ",
             "width=\"{}\" height=\"{}\" ",
@@ -645,7 +815,7 @@ fn render_svg(
             "</svg>"
         ),
         actual_width, actual_width, total, total, total, total, background, path, foreground
-    )
+    ))
 }
 
 fn render_matrix(code: &QrCode, module_count: u32) -> Result<Vec<u8>, QrError> {
@@ -669,6 +839,26 @@ fn render_matrix(code: &QrCode, module_count: u32) -> Result<Vec<u8>, QrError> {
     .map_err(|_| QrError::RenderFailed {
         format: "matrix JSON",
     })
+}
+
+fn decode_bounded_base64(encoded: &str) -> Result<Vec<u8>, QrError> {
+    if encoded.len() > MAX_BASE64_ENCODED_BYTES {
+        return Err(QrError::PayloadTooLarge {
+            actual: encoded.len().saturating_mul(3) / 4,
+            maximum: MAX_PAYLOAD_BYTES,
+        });
+    }
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| invalid("base64", error))?;
+    if decoded.len() > MAX_PAYLOAD_BYTES {
+        return Err(QrError::PayloadTooLarge {
+            actual: decoded.len(),
+            maximum: MAX_PAYLOAD_BYTES,
+        });
+    }
+    Ok(decoded)
 }
 
 fn parse_color(field: &'static str, value: &str) -> Result<Rgba<u8>, QrError> {
@@ -1086,7 +1276,7 @@ mod tests {
                 value: expected.to_owned(),
             },
             render: RenderOptions {
-                width: 768,
+                width: Width::try_from(768).expect("valid width"),
                 error_correction: ErrorCorrection::High,
                 ..RenderOptions::default()
             },
@@ -1139,8 +1329,25 @@ mod tests {
         assert!(matches!(render(&spec), Err(QrError::InvalidField { .. })));
 
         spec.render.background = "#ffffff".to_owned();
-        spec.render.width = MAX_WIDTH + 1;
-        assert!(matches!(render(&spec), Err(QrError::InvalidWidth)));
+        assert!(matches!(
+            Width::try_from(MAX_WIDTH + 1),
+            Err(QrError::InvalidWidth)
+        ));
+        let invalid_width = serde_json::json!({
+            "data": {"kind": "text", "value": "hello"},
+            "render": {"format": "png", "width": MAX_WIDTH + 1}
+        });
+        assert!(serde_json::from_value::<QrSpec>(invalid_width).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_base64_before_decoding() {
+        let oversized = "A".repeat(MAX_BASE64_ENCODED_BYTES + 1);
+        let data = QrData::Bytes { base64: oversized };
+        assert!(matches!(
+            payload_bytes(&data),
+            Err(QrError::PayloadTooLarge { .. })
+        ));
     }
 
     #[test]

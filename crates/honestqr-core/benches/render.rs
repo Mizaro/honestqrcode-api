@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use honestqr_core::{ErrorCorrection, QrData, QrFormat, QrSpec, RenderOptions, render};
+use honestqr_core::{QrData, QrFormat, QrSpec, RenderOptions, render};
 
 fn render_benchmarks(criterion: &mut Criterion) {
     let payloads = [
@@ -20,8 +20,6 @@ fn render_benchmarks(criterion: &mut Criterion) {
                 },
                 render: RenderOptions {
                     format,
-                    width: 512,
-                    error_correction: ErrorCorrection::Medium,
                     ..RenderOptions::default()
                 },
             };

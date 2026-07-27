@@ -1,5 +1,6 @@
 //! Axum adapter for the transport-independent Honest QR renderer.
 
+use bytes::Bytes;
 use std::convert::Infallible;
 use std::io::{Cursor, Write};
 use std::pin::Pin;
@@ -18,8 +19,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_core::Stream;
 use honestqr_core::{
-    ErrorCorrection, MAX_WIDTH, MIN_WIDTH, QrArtifact, QrData, QrError, QrFormat, QrMetadata,
-    QrSpec, RenderOptions, render,
+    ErrorCorrection, MAX_WIDTH, MIN_WIDTH, Margin, QrArtifact, QrData, QrError, QrFormat,
+    QrMetadata, QrSpec, RenderOptions, Width, render_validated,
 };
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
@@ -160,10 +161,11 @@ impl Metrics {
     }
 }
 
-/// Construct the complete HTTP adapter. The same router is used by the native
-/// server, integration tests, and Lambda adapter.
+/// Construct the complete HTTP adapter. The same router is used by integration
+/// tests with safe default configuration.
 pub fn router(config: AppConfig) -> Router {
-    try_router(config).expect("invalid honestqr HTTP configuration")
+    try_router(config)
+        .unwrap_or_else(|error| panic!("invalid honestqr HTTP configuration: {error}"))
 }
 
 /// Construct the HTTP adapter after validating that its limits are safe for
@@ -393,11 +395,14 @@ async fn ready() -> Response {
         },
         render: RenderOptions {
             format: QrFormat::Matrix,
-            width: 128,
+            width: Width::try_from(128).expect("ready width"),
             ..RenderOptions::default()
         },
     };
-    match render(&spec) {
+    match spec
+        .validate()
+        .and_then(|validated| render_validated(&validated))
+    {
         Ok(_) => (StatusCode::OK, "ready\n").into_response(),
         Err(error) => {
             warn!(error = %error, "readiness render failed");
@@ -425,17 +430,19 @@ struct SimpleQrQuery {
     background: Option<String>,
 }
 
-impl From<SimpleQrQuery> for QrSpec {
-    fn from(query: SimpleQrQuery) -> Self {
+impl TryFrom<SimpleQrQuery> for QrSpec {
+    type Error = QrError;
+
+    fn try_from(query: SimpleQrQuery) -> Result<Self, Self::Error> {
         let mut options = RenderOptions::default();
         if let Some(format) = query.format {
             options.format = format;
         }
         if let Some(width) = query.width {
-            options.width = width;
+            options.width = Width::try_from(width)?;
         }
         if let Some(margin) = query.margin {
-            options.margin = margin;
+            options.margin = Margin::try_from(margin)?;
         }
         if let Some(error_correction) = query.error_correction {
             options.error_correction = error_correction;
@@ -446,10 +453,10 @@ impl From<SimpleQrQuery> for QrSpec {
         if let Some(background) = query.background {
             options.background = background;
         }
-        Self {
+        Ok(Self {
             data: QrData::Text { value: query.data },
             render: options,
-        }
+        })
     }
 }
 
@@ -476,7 +483,11 @@ async fn get_qr(
         Ok(query) => query,
         Err(rejection) => return ApiError::from_query_rejection(rejection).into_response(),
     };
-    render_response(&state, QrSpec::from(query), CachePolicy::Public).await
+    let spec = match QrSpec::try_from(query) {
+        Ok(spec) => spec,
+        Err(error) => return ApiError::from_qr(error).into_response(),
+    };
+    render_response(&state, spec, CachePolicy::Public).await
 }
 
 #[utoipa::path(
@@ -698,8 +709,12 @@ fn create_zip(specs: &[QrSpec], cancellation: &Cancellation) -> Result<Vec<u8>, 
         if cancellation.is_cancelled() {
             return Err(BatchArchiveError::Cancelled);
         }
-        let artifact = render(spec).map_err(|error| BatchArchiveError::Render { index, error })?;
-        let filename = format!("qr-{:03}.{}", index + 1, artifact.metadata.extension);
+        let validated = spec
+            .validate()
+            .map_err(|error| BatchArchiveError::Render { index, error })?;
+        let artifact = render_validated(&validated)
+            .map_err(|error| BatchArchiveError::Render { index, error })?;
+        let filename = format!("qr-{:03}.{}", index + 1, artifact.metadata.extension());
         archive.start_file(&filename, options)?;
         archive.write_all(&artifact.bytes)?;
         manifest_items.push(BatchManifestItem {
@@ -746,7 +761,7 @@ impl Drop for CancelOnDrop {
 }
 
 struct BudgetedBytesStream {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     offset: usize,
     _permit: OwnedSemaphorePermit,
 }
@@ -754,7 +769,7 @@ struct BudgetedBytesStream {
 impl BudgetedBytesStream {
     fn new(bytes: Vec<u8>, permit: OwnedSemaphorePermit) -> Self {
         Self {
-            bytes,
+            bytes: Bytes::from(bytes),
             offset: 0,
             _permit: permit,
         }
@@ -762,7 +777,7 @@ impl BudgetedBytesStream {
 }
 
 impl Stream for BudgetedBytesStream {
-    type Item = Result<Vec<u8>, Infallible>;
+    type Item = Result<Bytes, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.offset == self.bytes.len() {
@@ -772,7 +787,7 @@ impl Stream for BudgetedBytesStream {
             .offset
             .saturating_add(RESPONSE_CHUNK_BYTES)
             .min(self.bytes.len());
-        let chunk = self.bytes[self.offset..end].to_vec();
+        let chunk = self.bytes.slice(self.offset..end);
         self.offset = end;
         Poll::Ready(Some(Ok(chunk)))
     }
@@ -781,7 +796,7 @@ impl Stream for BudgetedBytesStream {
 fn render_cost(spec: &QrSpec) -> Result<u32, ApiError> {
     // Invalid widths are left for the core validator; clamping here only keeps
     // estimation arithmetic bounded and does not make them renderable.
-    let width = u64::from(spec.render.width.clamp(MIN_WIDTH, MAX_WIDTH));
+    let width = u64::from(spec.render.width.get().clamp(MIN_WIDTH, MAX_WIDTH));
     let estimated_bytes = match spec.render.format {
         // PNG rendering holds an RGBA image plus encoder/output buffers.
         QrFormat::Png => width
@@ -792,6 +807,7 @@ fn render_cost(spec: &QrSpec) -> Result<u32, ApiError> {
         // validation and serialized metadata, so it remains in the estimate.
         QrFormat::Svg => 512 * 1024 + width * 128,
         QrFormat::Matrix => 256 * 1024 + width * 64,
+        _ => 256 * 1024 + width * 64,
     };
     let units = estimated_bytes.saturating_add(1023) / 1024;
     if units > u64::from(MAX_REQUEST_COST_UNITS) {
@@ -820,7 +836,7 @@ fn batch_cost(specs: &[QrSpec]) -> Result<u32, ApiError> {
 }
 
 fn retained_artifact_cost(spec: &QrSpec) -> u64 {
-    let width = u64::from(spec.render.width.clamp(MIN_WIDTH, MAX_WIDTH));
+    let width = u64::from(spec.render.width.get().clamp(MIN_WIDTH, MAX_WIDTH));
     let estimated_bytes = match spec.render.format {
         // QR pixels are binary and compress well, but one byte per output
         // pixel plus framing is a conservative retained-PNG allowance.
@@ -829,6 +845,7 @@ fn retained_artifact_cost(spec: &QrSpec) -> u64 {
         // requested display width.
         QrFormat::Svg => 512 * 1024,
         QrFormat::Matrix => 256 * 1024,
+        _ => 256 * 1024,
     };
     estimated_bytes.saturating_add(1023) / 1024
 }
@@ -858,6 +875,13 @@ async fn render_response(state: &AppState, spec: QrSpec, cache: CachePolicy) -> 
             return error.into_response();
         }
     };
+    let validated = match spec.validate() {
+        Ok(validated) => validated,
+        Err(error) => {
+            state.metrics.failures.inc();
+            return ApiError::from_qr(error).into_response();
+        }
+    };
     let permit = match state.admission.try_acquire(cost) {
         Ok(permit) => permit,
         Err(error) => {
@@ -866,8 +890,10 @@ async fn render_response(state: &AppState, spec: QrSpec, cache: CachePolicy) -> 
         }
     };
     let started = Instant::now();
-    match tokio::task::spawn_blocking(move || render(&spec).map(|artifact| (artifact, permit)))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        render_validated(&validated).map(|artifact| (artifact, permit))
+    })
+    .await
     {
         Ok(Ok((artifact, permit))) => {
             state.metrics.successes.inc();
@@ -904,14 +930,14 @@ fn artifact_response(
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(&artifact.metadata.content_type)
+        HeaderValue::from_str(artifact.metadata.content_type())
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!(
             "inline; filename=qr.{}",
-            artifact.metadata.extension
+            artifact.metadata.extension()
         ))
         .unwrap_or_else(|_| HeaderValue::from_static("inline")),
     );
@@ -1122,7 +1148,7 @@ mod tests {
             },
             render: RenderOptions {
                 format,
-                width,
+                width: Width::try_from(width).expect("valid width"),
                 ..RenderOptions::default()
             },
         }
@@ -1377,7 +1403,7 @@ mod tests {
     #[test]
     fn documented_default_batch_fits_the_memory_budget() {
         let items = (0..DEFAULT_MAX_BATCH_ITEMS)
-            .map(|_| valid_spec(QrFormat::Png, RenderOptions::default().width))
+            .map(|_| valid_spec(QrFormat::Png, RenderOptions::default().width.get()))
             .collect::<Vec<_>>();
         let cost = batch_cost(&items).expect("default batch cost");
 

@@ -12,6 +12,7 @@ authors.workspace = true
 [dependencies]
 axum.workspace = true
 base64.workspace = true
+bytes.workspace = true
 futures-core.workspace = true
 honestqr-core = { version = "0.1.1", path = "../honestqr-core" }
 http.workspace = true

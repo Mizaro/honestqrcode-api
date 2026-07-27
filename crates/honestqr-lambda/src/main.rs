@@ -1,5 +1,5 @@
 use axum::body::Body as AxumBody;
-use honestqr_http::{AppConfig, router};
+use honestqr_http::{AppConfig, try_router};
 use http_body_util::BodyExt;
 use lambda_http::{Body, Error, Request, Response, run, service_fn};
 use tower::ServiceExt;
@@ -7,7 +7,7 @@ use tower::ServiceExt;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     lambda_http::tracing::init_default_subscriber();
-    let app = router(AppConfig::default());
+    let app = try_router(AppConfig::default()).map_err(|error| Error::from(error.to_string()))?;
     run(service_fn(move |request| {
         let app = app.clone();
         async move { handle(app, request).await }

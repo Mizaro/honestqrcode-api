@@ -44,11 +44,12 @@ pub const DEFAULT_MAX_BATCH_ITEMS: usize = 100;
 pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 15;
 
-// Cost units are conservative KiB estimates of peak renderer memory. Keeping
-// active work to 64 MiB leaves half of a 128 MiB pod for the runtime, request
-// parsing, task stacks, and allocator overhead.
-const MAX_ACTIVE_COST_UNITS: u32 = 64 * 1024;
-const MAX_REQUEST_COST_UNITS: u32 = MAX_ACTIVE_COST_UNITS;
+/// Active render-memory budget for the documented 128 MiB Kubernetes pod.
+pub const PROFILE_128_MIB_ACTIVE_COST_KIB: u32 = 64 * 1024;
+/// Active render-memory budget for a 256 MiB container (64 MiB runtime headroom).
+pub const PROFILE_256_MIB_ACTIVE_COST_KIB: u32 = 192 * 1024;
+pub const DEFAULT_MAX_ACTIVE_COST_KIB: u32 = PROFILE_128_MIB_ACTIVE_COST_KIB;
+
 const MAX_SAFE_BODY_BYTES: usize = DEFAULT_MAX_BODY_BYTES;
 const MAX_SAFE_CONCURRENCY: usize = 64;
 const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
@@ -59,6 +60,7 @@ pub struct AppConfig {
     pub max_batch_items: usize,
     pub max_concurrency: usize,
     pub request_timeout_seconds: u64,
+    pub max_active_cost_kib: u32,
 }
 
 impl Default for AppConfig {
@@ -68,6 +70,7 @@ impl Default for AppConfig {
             max_batch_items: DEFAULT_MAX_BATCH_ITEMS,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             request_timeout_seconds: DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            max_active_cost_kib: DEFAULT_MAX_ACTIVE_COST_KIB,
         }
     }
 }
@@ -82,24 +85,27 @@ struct AppState {
 #[derive(Clone)]
 struct Admission {
     permits: Arc<Semaphore>,
+    max_request_cost_kib: u32,
 }
 
 impl Admission {
-    fn new() -> Self {
+    fn new(max_active_cost_kib: u32) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(MAX_ACTIVE_COST_UNITS as usize)),
+            permits: Arc::new(Semaphore::new(max_active_cost_kib as usize)),
+            max_request_cost_kib: max_active_cost_kib,
         }
     }
 
     fn try_acquire(&self, cost: u32) -> Result<OwnedSemaphorePermit, ApiError> {
-        if cost > MAX_REQUEST_COST_UNITS {
+        if cost > self.max_request_cost_kib {
             return Err(ApiError::with_status(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request_too_expensive",
                 "requested render exceeds the maximum work cost",
             )
             .with_detail(format!(
-                "estimated cost is {cost} KiB; maximum is {MAX_REQUEST_COST_UNITS} KiB"
+                "estimated cost is {cost} KiB; maximum is {} KiB",
+                self.max_request_cost_kib
             )));
         }
         self.permits
@@ -177,9 +183,9 @@ pub fn try_router(config: AppConfig) -> Result<Router, AppConfigError> {
     let max_concurrency = config.max_concurrency.max(1);
     let request_timeout = Duration::from_secs(config.request_timeout_seconds.max(1));
     let state = AppState {
-        config,
+        config: config.clone(),
         metrics: Metrics::new(),
-        admission: Admission::new(),
+        admission: Admission::new(config.max_active_cost_kib),
     };
 
     let render_routes = Router::new()
@@ -248,6 +254,12 @@ fn validate_config(config: &AppConfig) -> Result<(), AppConfigError> {
         ))
     } else if config.request_timeout_seconds == 0 {
         Some("request_timeout_seconds must be greater than zero".to_owned())
+    } else if config.max_active_cost_kib == 0 {
+        Some("max_active_cost_kib must be greater than zero".to_owned())
+    } else if config.max_active_cost_kib > PROFILE_256_MIB_ACTIVE_COST_KIB {
+        Some(format!(
+            "max_active_cost_kib must not exceed {PROFILE_256_MIB_ACTIVE_COST_KIB}"
+        ))
     } else {
         None
     };
@@ -578,7 +590,7 @@ async fn post_batch(
         .into_response();
     }
 
-    let cost = match batch_cost(&batch.items) {
+    let cost = match batch_cost(&batch.items, state.config.max_active_cost_kib) {
         Ok(cost) => cost,
         Err(error) => {
             state.metrics.failures.inc();
@@ -793,7 +805,7 @@ impl Stream for BudgetedBytesStream {
     }
 }
 
-fn render_cost(spec: &QrSpec) -> Result<u32, ApiError> {
+fn render_cost(spec: &QrSpec, max_active_cost_kib: u32) -> Result<u32, ApiError> {
     // Invalid widths are left for the core validator; clamping here only keeps
     // estimation arithmetic bounded and does not make them renderable.
     let width = u64::from(spec.render.width.get().clamp(MIN_WIDTH, MAX_WIDTH));
@@ -810,26 +822,26 @@ fn render_cost(spec: &QrSpec) -> Result<u32, ApiError> {
         _ => 256 * 1024 + width * 64,
     };
     let units = estimated_bytes.saturating_add(1023) / 1024;
-    if units > u64::from(MAX_REQUEST_COST_UNITS) {
-        return Err(request_cost_error(units));
+    if units > u64::from(max_active_cost_kib) {
+        return Err(request_cost_error(units, max_active_cost_kib));
     }
     Ok(units as u32)
 }
 
-fn batch_cost(specs: &[QrSpec]) -> Result<u32, ApiError> {
+fn batch_cost(specs: &[QrSpec], max_active_cost_kib: u32) -> Result<u32, ApiError> {
     // Batch rendering is sequential. Account for the archive retained from
     // prior items separately from the current item's peak rendering memory,
     // including a second output-sized allowance while ZIP compression writes.
     let mut retained = 64_u64;
     let mut peak = retained;
     for spec in specs {
-        let render = u64::from(render_cost(spec)?);
+        let render = u64::from(render_cost(spec, max_active_cost_kib)?);
         let output = retained_artifact_cost(spec);
         peak = peak.max(retained.saturating_add(render).saturating_add(output));
         retained = retained.saturating_add(output);
         peak = peak.max(retained);
-        if peak > u64::from(MAX_REQUEST_COST_UNITS) {
-            return Err(request_cost_error(peak));
+        if peak > u64::from(max_active_cost_kib) {
+            return Err(request_cost_error(peak, max_active_cost_kib));
         }
     }
     Ok(peak as u32)
@@ -850,14 +862,14 @@ fn retained_artifact_cost(spec: &QrSpec) -> u64 {
     estimated_bytes.saturating_add(1023) / 1024
 }
 
-fn request_cost_error(cost: u64) -> ApiError {
+fn request_cost_error(cost: u64, max_active_cost_kib: u32) -> ApiError {
     ApiError::with_status(
         StatusCode::PAYLOAD_TOO_LARGE,
         "request_too_expensive",
         "requested render exceeds the maximum work cost",
     )
     .with_detail(format!(
-        "estimated cost is {cost} KiB; maximum is {MAX_REQUEST_COST_UNITS} KiB"
+        "estimated cost is {cost} KiB; maximum is {max_active_cost_kib} KiB"
     ))
 }
 
@@ -868,7 +880,7 @@ enum CachePolicy {
 
 async fn render_response(state: &AppState, spec: QrSpec, cache: CachePolicy) -> Response {
     state.metrics.requests.inc();
-    let cost = match render_cost(&spec) {
+    let cost = match render_cost(&spec, state.config.max_active_cost_kib) {
         Ok(cost) => cost,
         Err(error) => {
             state.metrics.failures.inc();
@@ -1391,10 +1403,23 @@ mod tests {
 
     #[test]
     fn cost_estimate_is_width_and_format_aware() {
-        let small_png = render_cost(&valid_spec(QrFormat::Png, 256)).expect("small PNG cost");
-        let large_png = render_cost(&valid_spec(QrFormat::Png, 1024)).expect("large PNG cost");
-        let svg = render_cost(&valid_spec(QrFormat::Svg, 1024)).expect("SVG cost");
-        let matrix = render_cost(&valid_spec(QrFormat::Matrix, 1024)).expect("matrix cost");
+        let small_png = render_cost(&valid_spec(QrFormat::Png, 256), DEFAULT_MAX_ACTIVE_COST_KIB)
+            .expect("small PNG cost");
+        let large_png = render_cost(
+            &valid_spec(QrFormat::Png, 1024),
+            DEFAULT_MAX_ACTIVE_COST_KIB,
+        )
+        .expect("large PNG cost");
+        let svg = render_cost(
+            &valid_spec(QrFormat::Svg, 1024),
+            DEFAULT_MAX_ACTIVE_COST_KIB,
+        )
+        .expect("SVG cost");
+        let matrix = render_cost(
+            &valid_spec(QrFormat::Matrix, 1024),
+            DEFAULT_MAX_ACTIVE_COST_KIB,
+        )
+        .expect("matrix cost");
         assert!(large_png > small_png);
         assert!(large_png > svg);
         assert!(svg > matrix);
@@ -1405,17 +1430,19 @@ mod tests {
         let items = (0..DEFAULT_MAX_BATCH_ITEMS)
             .map(|_| valid_spec(QrFormat::Png, RenderOptions::default().width.get()))
             .collect::<Vec<_>>();
-        let cost = batch_cost(&items).expect("default batch cost");
+        let cost = batch_cost(&items, DEFAULT_MAX_ACTIVE_COST_KIB).expect("default batch cost");
 
-        assert!(cost <= MAX_REQUEST_COST_UNITS);
-        assert!(cost > render_cost(&items[0]).expect("single render cost"));
+        assert!(cost <= DEFAULT_MAX_ACTIVE_COST_KIB);
+        assert!(
+            cost > render_cost(&items[0], DEFAULT_MAX_ACTIVE_COST_KIB).expect("single render cost")
+        );
     }
 
     #[tokio::test]
     async fn admission_rejects_concurrent_cost() {
-        let admission = Admission::new();
+        let admission = Admission::new(DEFAULT_MAX_ACTIVE_COST_KIB);
         let _all_capacity = admission
-            .try_acquire(MAX_ACTIVE_COST_UNITS)
+            .try_acquire(DEFAULT_MAX_ACTIVE_COST_KIB)
             .expect("initial capacity");
         let error = admission.try_acquire(1).expect_err("capacity rejection");
         assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
@@ -1424,7 +1451,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_body_holds_admission_until_consumed_or_dropped() {
-        let admission = Admission::new();
+        let admission = Admission::new(DEFAULT_MAX_ACTIVE_COST_KIB);
         let cost = 1024;
         let permit = admission.try_acquire(cost).expect("response capacity");
         let body = Body::from_stream(BudgetedBytesStream::new(
@@ -1433,14 +1460,14 @@ mod tests {
         ));
         assert_eq!(
             admission.permits.available_permits(),
-            MAX_ACTIVE_COST_UNITS as usize - cost as usize
+            DEFAULT_MAX_ACTIVE_COST_KIB as usize - cost as usize
         );
 
         let bytes = body.collect().await.expect("consume response").to_bytes();
         assert_eq!(bytes.len(), RESPONSE_CHUNK_BYTES * 2);
         assert_eq!(
             admission.permits.available_permits(),
-            MAX_ACTIVE_COST_UNITS as usize
+            DEFAULT_MAX_ACTIVE_COST_KIB as usize
         );
 
         let permit = admission.try_acquire(cost).expect("response capacity");
@@ -1448,15 +1475,15 @@ mod tests {
         drop(body);
         assert_eq!(
             admission.permits.available_permits(),
-            MAX_ACTIVE_COST_UNITS as usize
+            DEFAULT_MAX_ACTIVE_COST_KIB as usize
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_blocking_handle_does_not_release_capacity_early() {
-        let admission = Admission::new();
+        let admission = Admission::new(DEFAULT_MAX_ACTIVE_COST_KIB);
         let permit = admission
-            .try_acquire(MAX_ACTIVE_COST_UNITS)
+            .try_acquire(DEFAULT_MAX_ACTIVE_COST_KIB)
             .expect("all capacity");
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1475,7 +1502,7 @@ mod tests {
         release_tx.send(()).expect("release worker");
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if admission.permits.available_permits() == MAX_ACTIVE_COST_UNITS as usize {
+                if admission.permits.available_permits() == DEFAULT_MAX_ACTIVE_COST_KIB as usize {
                     break;
                 }
                 tokio::task::yield_now().await;

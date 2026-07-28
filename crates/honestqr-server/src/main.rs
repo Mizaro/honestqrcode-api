@@ -40,6 +40,12 @@ struct Args {
         default_value_t = honestqr_http::DEFAULT_REQUEST_TIMEOUT_SECONDS
     )]
     request_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "HONESTQR_MAX_ACTIVE_MEMORY_KIB",
+        default_value_t = honestqr_http::DEFAULT_MAX_ACTIVE_COST_KIB
+    )]
+    max_active_cost_kib: u32,
     #[arg(long, env = "HONESTQR_JSON_LOGS", default_value_t = false)]
     json_logs: bool,
 }
@@ -58,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_batch_items: args.max_batch_items,
         max_concurrency: args.max_concurrency,
         request_timeout_seconds: args.request_timeout_seconds,
+        max_active_cost_kib: args.max_active_cost_kib,
     })?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

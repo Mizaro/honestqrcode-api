@@ -8,7 +8,7 @@
 use std::fmt::Write as FmtWrite;
 use std::io::Cursor;
 
-use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, ImageFormat, Rgba};
 use qrcode::{EcLevel, QrCode, types::Color as ModuleColor};
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
@@ -722,13 +722,12 @@ fn render_png(
     foreground: Rgba<u8>,
     background: Rgba<u8>,
 ) -> Result<Vec<u8>, QrError> {
-    let mut image = RgbaImage::from_pixel(actual_width, actual_width, background);
-    let margin_pixels = u32::from(margin.get()) * scale;
+    let total_modules = module_count + (u32::from(margin.get()) * 2);
+    let margin_modules = u32::from(margin.get());
+    let foreground_luma = luma_from_rgba(foreground);
+    let background_luma = luma_from_rgba(background);
+    let mut image = GrayImage::from_pixel(total_modules, total_modules, background_luma);
     let colors = code.to_colors();
-    let stride =
-        usize::try_from(actual_width).map_err(|_| QrError::RenderFailed { format: "PNG" })? * 4;
-    let pixels = image.as_mut();
-    let foreground_bytes = foreground.0;
 
     for y in 0..module_count {
         for x in 0..module_count {
@@ -737,29 +736,30 @@ fn render_png(
             if colors[index] != ModuleColor::Dark {
                 continue;
             }
-            let start_x = margin_pixels + (x * scale);
-            let start_y = margin_pixels + (y * scale);
-            let start_x =
-                usize::try_from(start_x).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
-            let start_y =
-                usize::try_from(start_y).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
-            let scale =
-                usize::try_from(scale).map_err(|_| QrError::RenderFailed { format: "PNG" })?;
-            for row_offset in 0..scale {
-                let row_start = (start_y + row_offset) * stride + start_x * 4;
-                for column in 0..scale {
-                    let idx = row_start + column * 4;
-                    pixels[idx..idx + 4].copy_from_slice(&foreground_bytes);
-                }
-            }
+            image.put_pixel(x + margin_modules, y + margin_modules, foreground_luma);
         }
     }
 
+    let image = if scale == 1 {
+        image
+    } else {
+        image::imageops::resize(
+            &image,
+            actual_width,
+            actual_width,
+            image::imageops::FilterType::Nearest,
+        )
+    };
+
     let mut output = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(image)
+    DynamicImage::ImageLuma8(image)
         .write_to(&mut output, ImageFormat::Png)
         .map_err(|_| QrError::RenderFailed { format: "PNG" })?;
     Ok(output.into_inner())
+}
+
+fn luma_from_rgba(color: Rgba<u8>) -> image::Luma<u8> {
+    image::Luma([color.0[0]])
 }
 
 fn render_svg(

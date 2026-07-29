@@ -2,9 +2,9 @@
 
 use bytes::Bytes;
 use std::convert::Infallible;
-use std::io::{Cursor, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -389,23 +389,29 @@ async fn health() -> &'static str {
     )
 )]
 async fn ready() -> Response {
-    let spec = QrSpec {
-        data: QrData::Text {
-            value: "ready".to_owned(),
-        },
-        render: RenderOptions {
-            format: QrFormat::Matrix,
-            width: Width::try_from(128).expect("ready width"),
-            ..RenderOptions::default()
-        },
-    };
-    match spec
-        .validate()
-        .and_then(|validated| render_validated(&validated))
+    match tokio::task::spawn_blocking(|| {
+        let spec = QrSpec {
+            data: QrData::Text {
+                value: "ready".to_owned(),
+            },
+            render: RenderOptions {
+                format: QrFormat::Matrix,
+                width: Width::try_from(128).expect("ready width"),
+                ..RenderOptions::default()
+            },
+        };
+        spec.validate()
+            .and_then(|validated| render_validated(&validated))
+    })
+    .await
     {
-        Ok(_) => (StatusCode::OK, "ready\n").into_response(),
-        Err(error) => {
+        Ok(Ok(_)) => (StatusCode::OK, "ready\n").into_response(),
+        Ok(Err(error)) => {
             warn!(error = %error, "readiness render failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
+        }
+        Err(error) => {
+            warn!(error = %error, "readiness worker failed");
             (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
         }
     }
@@ -595,64 +601,39 @@ async fn post_batch(
 
     let started = Instant::now();
     let item_count = batch.items.len();
+    for (index, spec) in batch.items.iter().enumerate() {
+        if let Err(error) = spec.validate() {
+            state.metrics.failures.inc();
+            return ApiError::from_qr(error)
+                .with_detail(format!("item {index}"))
+                .into_response();
+        }
+    }
+
     let cancellation = Cancellation::new();
     let worker_cancellation = cancellation.clone();
     let _cancel_on_drop = CancelOnDrop(cancellation);
-    let work = tokio::task::spawn_blocking(move || {
-        // The permit belongs to the blocking worker, not its JoinHandle. If the
-        // request times out and drops the handle, capacity stays reserved until
-        // work stops; on success it transfers to the response body.
-        create_zip(&batch.items, &worker_cancellation)
-            .map(|archive| (archive, permit))
-            .map_err(|error| match error {
-                BatchArchiveError::Render { index, error } => {
-                    ApiError::from_qr(error).with_detail(format!("item {index}"))
-                }
-                BatchArchiveError::Cancelled => ApiError::with_status(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "request_timeout",
-                    "request exceeded the configured time limit",
-                ),
-                error => {
-                    warn!(error = %error, "failed to build batch archive");
-                    ApiError::with_status(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "archive_failed",
-                        "failed to build batch archive",
-                    )
-                }
-            })
-    })
-    .await;
+    let items = batch.items;
+    let successes = state.metrics.successes.clone();
+    let failures = state.metrics.failures.clone();
+    let render_duration = state.metrics.render_duration.clone();
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+    let worker =
+        std::thread::spawn(move || stream_zip_archive(&items, &worker_cancellation, chunk_tx));
 
-    let (archive, permit) = match work {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            state.metrics.failures.inc();
-            return error.into_response();
-        }
-        Err(error) => {
-            state.metrics.failures.inc();
-            warn!(error = %error, "batch worker failed");
-            return ApiError::with_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "worker_failed",
-                "render worker failed",
-            )
-            .into_response();
-        }
-    };
-
-    state.metrics.successes.inc_by(item_count as u64);
-    state
-        .metrics
-        .render_duration
-        .observe(started.elapsed().as_secs_f64());
-
-    // Keep weighted admission reserved while the archive is buffered for a
-    // slow client. Small chunks prevent Hyper from accepting the entire body
-    // and dropping the guard before socket backpressure has done its job.
-    let mut response = Body::from_stream(BudgetedBytesStream::new(archive, permit)).into_response();
+    let mut response = Body::from_stream(ZipChunkStream::new(
+        chunk_rx,
+        worker,
+        ZipChunkStreamContext {
+            successes,
+            failures,
+            render_duration,
+            started,
+            item_count,
+            permit,
+        },
+    ))
+    .into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/zip"),
@@ -671,6 +652,7 @@ enum BatchArchiveError {
     Zip(zip::result::ZipError),
     Io(std::io::Error),
     Manifest,
+    Worker,
 }
 
 impl std::fmt::Display for BatchArchiveError {
@@ -681,6 +663,7 @@ impl std::fmt::Display for BatchArchiveError {
             Self::Zip(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
             Self::Manifest => formatter.write_str("manifest serialization failed"),
+            Self::Worker => formatter.write_str("batch worker failed"),
         }
     }
 }
@@ -697,9 +680,13 @@ impl From<std::io::Error> for BatchArchiveError {
     }
 }
 
-fn create_zip(specs: &[QrSpec], cancellation: &Cancellation) -> Result<Vec<u8>, BatchArchiveError> {
-    let cursor = Cursor::new(Vec::new());
-    let mut archive = ZipWriter::new(cursor);
+fn write_zip_archive<W: Read + Write + Seek>(
+    writer: &mut W,
+    specs: &[QrSpec],
+    cancellation: &Cancellation,
+) -> Result<(), BatchArchiveError> {
+    let mut archive = ZipWriter::new(writer);
+    archive.set_flush_on_finish_file(true);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o644);
@@ -731,8 +718,161 @@ fn create_zip(specs: &[QrSpec], cancellation: &Cancellation) -> Result<Vec<u8>, 
     })
     .map_err(|_| BatchArchiveError::Manifest)?;
     archive.write_all(&manifest)?;
-    let cursor = archive.finish()?;
-    Ok(cursor.into_inner())
+    archive.finish()?;
+    Ok(())
+}
+
+fn stream_zip_archive(
+    specs: &[QrSpec],
+    cancellation: &Cancellation,
+    chunk_tx: tokio::sync::mpsc::Sender<Bytes>,
+) -> Result<(), BatchArchiveError> {
+    let mut archive_file = tempfile::NamedTempFile::new()?;
+    let mut reader = archive_file.reopen()?;
+    let writer_done = Arc::new(AtomicBool::new(false));
+    let done = writer_done.clone();
+    let position = Arc::new(AtomicU64::new(0));
+    let specs = specs.to_vec();
+    let cancel = cancellation.clone();
+
+    let writer = std::thread::spawn(move || -> Result<(), BatchArchiveError> {
+        let result = write_zip_archive(&mut archive_file, &specs, &cancel);
+        archive_file.flush()?;
+        done.store(true, Ordering::Release);
+        result
+    });
+
+    let mut buffer = vec![0_u8; RESPONSE_CHUNK_BYTES];
+    loop {
+        let file_len = reader.metadata()?.len();
+        let mut pos = position.load(Ordering::Acquire);
+        while pos < file_len {
+            let to_read = RESPONSE_CHUNK_BYTES.min((file_len - pos) as usize);
+            reader.seek(SeekFrom::Start(pos))?;
+            let read = reader.read(&mut buffer[..to_read])?;
+            if read == 0 {
+                break;
+            }
+            pos += read as u64;
+            position.store(pos, Ordering::Release);
+            if chunk_tx
+                .blocking_send(Bytes::copy_from_slice(&buffer[..read]))
+                .is_err()
+            {
+                let _ = writer.join();
+                return Ok(());
+            }
+        }
+
+        if writer_done.load(Ordering::Acquire) {
+            let final_len = reader.metadata()?.len();
+            if pos >= final_len {
+                break;
+            }
+            continue;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+
+    writer.join().map_err(|_| BatchArchiveError::Worker)??;
+    Ok(())
+}
+
+struct ZipChunkStreamContext {
+    successes: Counter,
+    failures: Counter,
+    render_duration: Histogram,
+    started: Instant,
+    item_count: usize,
+    permit: OwnedSemaphorePermit,
+}
+
+struct ZipChunkStream {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    worker: Option<std::thread::JoinHandle<Result<(), BatchArchiveError>>>,
+    successes: Counter,
+    failures: Counter,
+    render_duration: Histogram,
+    started: Instant,
+    item_count: usize,
+    recorded: bool,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ZipChunkStream {
+    fn new(
+        rx: tokio::sync::mpsc::Receiver<Bytes>,
+        worker: std::thread::JoinHandle<Result<(), BatchArchiveError>>,
+        context: ZipChunkStreamContext,
+    ) -> Self {
+        Self {
+            rx,
+            worker: Some(worker),
+            successes: context.successes,
+            failures: context.failures,
+            render_duration: context.render_duration,
+            started: context.started,
+            item_count: context.item_count,
+            recorded: false,
+            _permit: context.permit,
+        }
+    }
+
+    fn record_completion(&mut self, success: bool) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        if success {
+            self.successes.inc_by(self.item_count as u64);
+            self.render_duration
+                .observe(self.started.elapsed().as_secs_f64());
+        } else {
+            self.failures.inc();
+        }
+    }
+}
+
+impl Stream for ZipChunkStream {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(chunk))),
+            Poll::Ready(None) => {
+                if !self.recorded
+                    && let Some(worker) = self.worker.take()
+                {
+                    let success = match worker.join() {
+                        Ok(Ok(())) => true,
+                        Ok(Err(error)) => {
+                            warn!(error = %error, "failed to build batch archive");
+                            false
+                        }
+                        Err(error) => {
+                            warn!(error = ?error, "batch worker panicked");
+                            false
+                        }
+                    };
+                    self.record_completion(success);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ZipChunkStream {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+            self.record_completion(false);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -798,11 +938,14 @@ fn render_cost(spec: &QrSpec) -> Result<u32, ApiError> {
     // estimation arithmetic bounded and does not make them renderable.
     let width = u64::from(spec.render.width.get().clamp(MIN_WIDTH, MAX_WIDTH));
     let estimated_bytes = match spec.render.format {
-        // PNG rendering holds an RGBA image plus encoder/output buffers.
-        QrFormat::Png => width
-            .saturating_mul(width)
-            .saturating_mul(8)
-            .saturating_add(512 * 1024),
+        // PNG renders at module resolution, then scales a grayscale image once.
+        QrFormat::Png => {
+            let module_grid = 256_u64 * 256;
+            width
+                .saturating_mul(width)
+                .saturating_add(module_grid)
+                .saturating_add(512 * 1024)
+        }
         // Vector/matrix complexity is QR-size bounded, but width still affects
         // validation and serialized metadata, so it remains in the estimate.
         QrFormat::Svg => 512 * 1024 + width * 128,
@@ -817,37 +960,17 @@ fn render_cost(spec: &QrSpec) -> Result<u32, ApiError> {
 }
 
 fn batch_cost(specs: &[QrSpec]) -> Result<u32, ApiError> {
-    // Batch rendering is sequential. Account for the archive retained from
-    // prior items separately from the current item's peak rendering memory,
-    // including a second output-sized allowance while ZIP compression writes.
-    let mut retained = 64_u64;
-    let mut peak = retained;
+    // Streaming zip retains one rendered artifact at a time plus a small temp
+    // buffer, so batch cost is the peak single-item render cost.
+    let mut peak = 64_u64;
     for spec in specs {
         let render = u64::from(render_cost(spec)?);
-        let output = retained_artifact_cost(spec);
-        peak = peak.max(retained.saturating_add(render).saturating_add(output));
-        retained = retained.saturating_add(output);
-        peak = peak.max(retained);
+        peak = peak.max(render.saturating_add(64));
         if peak > u64::from(MAX_REQUEST_COST_UNITS) {
             return Err(request_cost_error(peak));
         }
     }
     Ok(peak as u32)
-}
-
-fn retained_artifact_cost(spec: &QrSpec) -> u64 {
-    let width = u64::from(spec.render.width.get().clamp(MIN_WIDTH, MAX_WIDTH));
-    let estimated_bytes = match spec.render.format {
-        // QR pixels are binary and compress well, but one byte per output
-        // pixel plus framing is a conservative retained-PNG allowance.
-        QrFormat::Png => width.saturating_mul(width).saturating_add(64 * 1024),
-        // Vector and matrix output is bounded mainly by QR module count, not
-        // requested display width.
-        QrFormat::Svg => 512 * 1024,
-        QrFormat::Matrix => 256 * 1024,
-        _ => 256 * 1024,
-    };
-    estimated_bytes.saturating_add(1023) / 1024
 }
 
 fn request_cost_error(cost: u64) -> ApiError {
@@ -1343,8 +1466,21 @@ mod tests {
         assert_api_error(response, StatusCode::PAYLOAD_TOO_LARGE, "body_too_large").await;
     }
 
+    #[test]
+    fn maximum_width_render_fits_the_streaming_memory_budget() {
+        let single = render_cost(&valid_spec(QrFormat::Png, MAX_WIDTH)).expect("single cost");
+        assert!(single <= MAX_REQUEST_COST_UNITS);
+
+        let items = (0..DEFAULT_MAX_BATCH_ITEMS)
+            .map(|_| valid_spec(QrFormat::Png, MAX_WIDTH))
+            .collect::<Vec<_>>();
+        let batch = batch_cost(&items).expect("batch cost");
+        assert!(batch <= MAX_REQUEST_COST_UNITS);
+        assert!(batch >= single);
+    }
+
     #[tokio::test]
-    async fn maximum_cost_rejects_unsafe_render_and_batch() {
+    async fn maximum_width_single_render_succeeds() {
         let body = serde_json::to_string(&valid_spec(QrFormat::Png, MAX_WIDTH)).expect("spec JSON");
         let response = router(AppConfig::default())
             .oneshot(
@@ -1357,36 +1493,8 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_api_error(
-            response,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request_too_expensive",
-        )
-        .await;
-
-        let items = (0..DEFAULT_MAX_BATCH_ITEMS)
-            .map(|_| valid_spec(QrFormat::Png, 1024))
-            .collect::<Vec<_>>();
-        let response = router(AppConfig::default())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/batch")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_string(&serde_json::json!({ "items": items }))
-                            .expect("batch JSON"),
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_api_error(
-            response,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request_too_expensive",
-        )
-        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
     }
 
     #[test]
@@ -1510,7 +1618,8 @@ mod tests {
 
         let cancellation = Cancellation::new();
         cancellation.cancel();
-        let error = create_zip(&[valid_spec(QrFormat::Svg, 256)], &cancellation)
+        let mut temp = tempfile::NamedTempFile::new().expect("temp file");
+        let error = write_zip_archive(&mut temp, &[valid_spec(QrFormat::Svg, 256)], &cancellation)
             .expect_err("cancelled batch");
         assert!(matches!(error, BatchArchiveError::Cancelled));
     }

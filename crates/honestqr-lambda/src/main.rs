@@ -27,7 +27,7 @@ async fn handle(app: axum::Router, request: Request) -> Result<Response<Body>, E
     let response = app.oneshot(request).await?;
     let (parts, body) = response.into_parts();
     let bytes = body.collect().await?.to_bytes();
-    Ok(Response::from_parts(parts, Body::Binary(bytes.to_vec())))
+    Ok(Response::from_parts(parts, Body::Binary(bytes.into())))
 }
 
 #[cfg(test)]
